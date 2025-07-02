@@ -19,6 +19,7 @@ ASPECT_RATIO_MIN = 0.5
 ASPECT_RATIO_MAX = 2.0
 
 prev_box = None
+repeated_violation_count = 0  # Track face/movement warnings
 
 # ====== LOAD FACE DETECTION MODEL ======
 print("[INIT] Loading face detection model...")
@@ -27,8 +28,9 @@ print("[INIT] Model loaded successfully.")
 
 # ====== ANALYSIS FUNCTION ======
 def process_frame(frame, frame_w, frame_h):
-    global prev_box
+    global prev_box, repeated_violation_count
     messages = []
+    local_violations = 0
 
     blob = cv2.dnn.blobFromImage(cv2.resize(frame, (300, 300)), 1.0,
                                  (300, 300), (104.0, 177.0, 123.0))
@@ -51,7 +53,7 @@ def process_frame(frame, frame_w, frame_h):
         messages.append("⚠️ No face detected.")
         prev_box = None
     elif len(faces) > 1:
-        messages.append("⚠️ Multiple faces detected.")
+        messages.append("⚠️ Multiple faces detected.")  # Excluded from repeat count
         prev_box = None
     else:
         (x1, y1, x2, y2) = faces[0]
@@ -59,26 +61,41 @@ def process_frame(frame, frame_w, frame_h):
         coverage = face_area / (frame_w * frame_h)
         aspect_ratio = (y2 - y1) / max((x2 - x1), 1)
 
+        # Face coverage warnings
         if coverage < PARTIAL_COVERAGE:
             messages.append("⚠️ Face not clearly visible. Please face the camera.")
+            local_violations += 1
         elif coverage < MIN_COVERAGE:
             messages.append("⚠️ Face partially visible. Adjust your position.")
+            local_violations += 1
 
+        # Angle
         if not (ASPECT_RATIO_MIN <= aspect_ratio <= ASPECT_RATIO_MAX):
             messages.append("⚠️ Unusual face angle. Look straight at the screen.")
 
+        # Frame edge
         margin_x = frame_w * EDGE_MARGIN_RATIO
         margin_y = frame_h * EDGE_MARGIN_RATIO
         if (x1 < margin_x or x2 > frame_w - margin_x or
             y1 < margin_y or y2 > frame_h - margin_y):
             messages.append("⚠️ Face is too close to screen edge.")
 
+        # Movement detection
         current_box = [x1, y1, x2, y2]
         if prev_box is not None:
             movement = np.sum(np.abs(np.array(current_box) - np.array(prev_box)))
             if movement > MOVEMENT_THRESHOLD:
                 messages.append("⚠️ Excessive movement detected.")
+                local_violations += 1
         prev_box = current_box
+
+    # Increment global count for only relevant issues
+    repeated_violation_count += local_violations
+
+    # Condensed warning every 4 issues
+    if repeated_violation_count >= 4:
+        repeated_violation_count = 0
+        return ["⚠️ Repeated face/movement violation detected. Please stay steady and visible."]
 
     return messages if messages else ["✅ All clear"]
 
