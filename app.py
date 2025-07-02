@@ -11,9 +11,9 @@ CORS(app)
 socketio = SocketIO(app, cors_allowed_origins="*")
 
 # ====== CONFIG ======
-MIN_COVERAGE = 0.08
-PARTIAL_COVERAGE = 0.04
-MOVEMENT_THRESHOLD = 150
+MIN_COVERAGE = 0.06 # Minimum face coverage to consider it valid
+PARTIAL_COVERAGE = 0.03 # Minimum face coverage to consider it partially visible
+MOVEMENT_THRESHOLD = 200
 EDGE_MARGIN_RATIO = 0.04
 ASPECT_RATIO_MIN = 0.5
 ASPECT_RATIO_MAX = 2.0
