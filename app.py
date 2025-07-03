@@ -1,3 +1,6 @@
+import eventlet
+eventlet.monkey_patch()
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit
@@ -8,25 +11,25 @@ import config  # Ensure this has RES10_PROTO_PATH and RES10_MODEL_PATH
 
 app = Flask(__name__)
 CORS(app)
-socketio = SocketIO(app, cors_allowed_origins="*")
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
 
 # ====== CONFIG ======
-MIN_COVERAGE = 0.06 # Minimum face coverage to consider it valid
-PARTIAL_COVERAGE = 0.03 # Minimum face coverage to consider it partially visible
-MOVEMENT_THRESHOLD = 200
+MIN_COVERAGE = 0.06              # Face clearly visible
+PARTIAL_COVERAGE = 0.03          # Face partially visible
+MOVEMENT_THRESHOLD = 300         # Allow natural head movement
 EDGE_MARGIN_RATIO = 0.04
-ASPECT_RATIO_MIN = 0.5
-ASPECT_RATIO_MAX = 2.0
+ASPECT_RATIO_MIN = 0.4           # Allow more tilt (portrait vs landscape)
+ASPECT_RATIO_MAX = 2.4
 
 prev_box = None
-repeated_violation_count = 0  # Track face/movement warnings
+repeated_violation_count = 0
 
-# ====== LOAD FACE DETECTION MODEL ======
+# ====== LOAD MODEL ======
 print("[INIT] Loading face detection model...")
 face_net = cv2.dnn.readNetFromCaffe(config.RES10_PROTO_PATH, config.RES10_MODEL_PATH)
 print("[INIT] Model loaded successfully.")
 
-# ====== ANALYSIS FUNCTION ======
+# ====== FRAME ANALYSIS FUNCTION ======
 def process_frame(frame, frame_w, frame_h):
     global prev_box, repeated_violation_count
     messages = []
@@ -34,6 +37,7 @@ def process_frame(frame, frame_w, frame_h):
 
     blob = cv2.dnn.blobFromImage(cv2.resize(frame, (300, 300)), 1.0,
                                  (300, 300), (104.0, 177.0, 123.0))
+
     try:
         face_net.setInput(blob)
         detections = face_net.forward()
@@ -53,7 +57,7 @@ def process_frame(frame, frame_w, frame_h):
         messages.append("⚠️ No face detected.")
         prev_box = None
     elif len(faces) > 1:
-        messages.append("⚠️ Multiple faces detected.")  # Excluded from repeat count
+        messages.append("⚠️ Multiple faces detected.")  # Not included in repeat counter
         prev_box = None
     else:
         (x1, y1, x2, y2) = faces[0]
@@ -61,7 +65,7 @@ def process_frame(frame, frame_w, frame_h):
         coverage = face_area / (frame_w * frame_h)
         aspect_ratio = (y2 - y1) / max((x2 - x1), 1)
 
-        # Face coverage warnings
+        # Coverage checks
         if coverage < PARTIAL_COVERAGE:
             messages.append("⚠️ Face not clearly visible. Please face the camera.")
             local_violations += 1
@@ -69,11 +73,11 @@ def process_frame(frame, frame_w, frame_h):
             messages.append("⚠️ Face partially visible. Adjust your position.")
             local_violations += 1
 
-        # Angle
+        # Angle check
         if not (ASPECT_RATIO_MIN <= aspect_ratio <= ASPECT_RATIO_MAX):
             messages.append("⚠️ Unusual face angle. Look straight at the screen.")
 
-        # Frame edge
+        # Frame edge check
         margin_x = frame_w * EDGE_MARGIN_RATIO
         margin_y = frame_h * EDGE_MARGIN_RATIO
         if (x1 < margin_x or x2 > frame_w - margin_x or
@@ -89,17 +93,15 @@ def process_frame(frame, frame_w, frame_h):
                 local_violations += 1
         prev_box = current_box
 
-    # Increment global count for only relevant issues
+    # Accumulate violations
     repeated_violation_count += local_violations
-
-    # Condensed warning every 4 issues
     if repeated_violation_count >= 4:
         repeated_violation_count = 0
         return ["⚠️ Repeated face/movement violation detected. Please stay steady and visible."]
 
     return messages if messages else ["✅ All clear"]
 
-# ====== HTTP ROUTES ======
+# ====== ROUTES ======
 @app.route("/", methods=["GET"])
 def index():
     return jsonify({"status": "Video proctoring server is running."})
@@ -119,10 +121,10 @@ def analyze():
     messages = process_frame(frame, w, h)
     return jsonify({"warning": " | ".join(messages)})
 
-# ====== WEBSOCKET EVENTS ======
+# ====== SOCKET EVENTS ======
 @socketio.on("connect")
 def on_connect():
-    print("[INFO] Client connected")
+    print("[INFO] WebSocket client connected")
     emit("connected", {"message": "WebSocket connected successfully"})
 
 @socketio.on("frame")
@@ -147,8 +149,8 @@ def on_frame(data):
 
 @socketio.on("disconnect")
 def on_disconnect():
-    print("[INFO] Client disconnected")
+    print("[INFO] WebSocket client disconnected")
 
-# ====== MAIN ======
+# ====== RUN APP ======
 if __name__ == "__main__":
-    socketio.run(app, debug=True, host="0.0.0.0", port=5000)
+    socketio.run(app, host="0.0.0.0", port=5000)
