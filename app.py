@@ -7,29 +7,44 @@ from flask_socketio import SocketIO, emit
 import cv2
 import numpy as np
 import base64
-import config  # Ensure this has RES10_PROTO_PATH and RES10_MODEL_PATH
+import config
 
 app = Flask(__name__)
 CORS(app)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
 
-# ====== CONFIG ======
-MIN_COVERAGE = 0.06              # Face clearly visible
-PARTIAL_COVERAGE = 0.03          # Face partially visible
-MOVEMENT_THRESHOLD = 300         # Allow natural head movement
-EDGE_MARGIN_RATIO = 0.04
-ASPECT_RATIO_MIN = 0.4           # Allow more tilt (portrait vs landscape)
-ASPECT_RATIO_MAX = 2.4
+# ========== CONFIGURABLE PROCTORING PARAMETERS ==========
+
+# 📷 Minimum percentage of face area (of total frame) that must be visible to be considered clear
+MIN_COVERAGE = 0.06              # 6% = stricter full visibility
+
+# ⚠️ Acceptable partial face threshold, below which it's considered insufficient visibility
+PARTIAL_COVERAGE = 0.03          # 3%
+
+# 🔁 Movement difference (in pixels) allowed between frames
+MOVEMENT_THRESHOLD = 200         # Lower = stricter movement detection
+
+# 🔲 How far the face can be from edges (ignored now but left as option)
+EDGE_MARGIN_RATIO = 0.04         # Disable this by commenting logic below
+
+# 📐 Acceptable aspect ratio of detected face (height/width)
+ASPECT_RATIO_MIN = 0.6
+ASPECT_RATIO_MAX = 1.8           # Adjust if tilted faces are common
+
+# 🔄 Warnings required before triggering a violation
+VIOLATION_TRIGGER = 2            # Every 2 local violations = 1 actual warning
+
+# ========================================================
 
 prev_box = None
 repeated_violation_count = 0
 
-# ====== LOAD MODEL ======
+# ====== LOAD FACE DETECTION MODEL ======
 print("[INIT] Loading face detection model...")
 face_net = cv2.dnn.readNetFromCaffe(config.RES10_PROTO_PATH, config.RES10_MODEL_PATH)
 print("[INIT] Model loaded successfully.")
 
-# ====== FRAME ANALYSIS FUNCTION ======
+# ====== FRAME PROCESSING FUNCTION ======
 def process_frame(frame, frame_w, frame_h):
     global prev_box, repeated_violation_count
     messages = []
@@ -37,7 +52,6 @@ def process_frame(frame, frame_w, frame_h):
 
     blob = cv2.dnn.blobFromImage(cv2.resize(frame, (300, 300)), 1.0,
                                  (300, 300), (104.0, 177.0, 123.0))
-
     try:
         face_net.setInput(blob)
         detections = face_net.forward()
@@ -57,7 +71,7 @@ def process_frame(frame, frame_w, frame_h):
         messages.append("⚠️ No face detected.")
         prev_box = None
     elif len(faces) > 1:
-        messages.append("⚠️ Multiple faces detected.")  # Not included in repeat counter
+        messages.append("⚠️ Multiple faces detected.")
         prev_box = None
     else:
         (x1, y1, x2, y2) = faces[0]
@@ -65,26 +79,19 @@ def process_frame(frame, frame_w, frame_h):
         coverage = face_area / (frame_w * frame_h)
         aspect_ratio = (y2 - y1) / max((x2 - x1), 1)
 
-        # Coverage checks
+        # ✅ Coverage check
         if coverage < PARTIAL_COVERAGE:
-            messages.append("⚠️ Face not clearly visible. Please face the camera.")
+            messages.append("⚠️ Face not clearly visible.")
             local_violations += 1
         elif coverage < MIN_COVERAGE:
-            messages.append("⚠️ Face partially visible. Adjust your position.")
+            messages.append("⚠️ Face partially visible.")
             local_violations += 1
 
-        # Angle check
+        # ✅ Angle check
         if not (ASPECT_RATIO_MIN <= aspect_ratio <= ASPECT_RATIO_MAX):
-            messages.append("⚠️ Unusual face angle. Look straight at the screen.")
+            messages.append("⚠️ Face angle is unusual. Look straight.")
 
-        # Frame edge check
-        margin_x = frame_w * EDGE_MARGIN_RATIO
-        margin_y = frame_h * EDGE_MARGIN_RATIO
-        if (x1 < margin_x or x2 > frame_w - margin_x or
-            y1 < margin_y or y2 > frame_h - margin_y):
-            messages.append("⚠️ Face is too close to screen edge.")
-
-        # Movement detection
+        # ✅ Movement detection
         current_box = [x1, y1, x2, y2]
         if prev_box is not None:
             movement = np.sum(np.abs(np.array(current_box) - np.array(prev_box)))
@@ -93,11 +100,11 @@ def process_frame(frame, frame_w, frame_h):
                 local_violations += 1
         prev_box = current_box
 
-    # Accumulate violations
+    # ✅ Final warning logic
     repeated_violation_count += local_violations
-    if repeated_violation_count >= 4:
+    if repeated_violation_count >= VIOLATION_TRIGGER:
         repeated_violation_count = 0
-        return ["⚠️ Repeated face/movement violation detected. Please stay steady and visible."]
+        return ["⚠️ Repeated face/movement violation."]
 
     return messages if messages else ["✅ All clear"]
 
@@ -151,6 +158,8 @@ def on_frame(data):
 def on_disconnect():
     print("[INFO] WebSocket client disconnected")
 
-# ====== RUN APP ======
+# ====== RUN SERVER ======
 if __name__ == "__main__":
     socketio.run(app, host="0.0.0.0", port=5000)
+# To run the server, use the command:
+# python app.py 
