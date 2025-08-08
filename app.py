@@ -1,165 +1,166 @@
-import eventlet
-eventlet.monkey_patch()
-
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit
 import cv2
 import numpy as np
 import base64
-import config
+import time
+
+RES10_PROTO_PATH = "deploy.prototxt.txt"
+RES10_MODEL_PATH = "res10_300x300_ssd_iter_140000.caffemodel"
+
+MIN_COVERAGE = 0.07         # 7% of frame area
+PARTIAL_COVERAGE = 0.04
+ASPECT_RATIO_MIN = 0.6
+ASPECT_RATIO_MAX = 1.8
+MOVEMENT_THRESHOLD = 200
+WARNINGS_PER_VIOLATION = 1
+LAST_N_WARNINGS = 3
 
 app = Flask(__name__)
 CORS(app)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
+socketio = SocketIO(app, cors_allowed_origins="*")
 
-# ========== CONFIGURABLE PROCTORING PARAMETERS ==========
+face_net = cv2.dnn.readNetFromCaffe(RES10_PROTO_PATH, RES10_MODEL_PATH)
+session_stats = {}  # session_id: { "count": int, "history": [], "prev_box": None }
 
-# 📷 Minimum percentage of face area (of total frame) that must be visible to be considered clear
-MIN_COVERAGE = 0.06              # 6% = stricter full visibility
+def analyze_frame(frame, session_id):
+    h, w = frame.shape[:2]
+    blob = cv2.dnn.blobFromImage(cv2.resize(frame, (300,300)), 1.0, (300,300), (104.0, 177.0, 123.0))
+    face_net.setInput(blob)
+    detections = face_net.forward()
 
-# ⚠️ Acceptable partial face threshold, below which it's considered insufficient visibility
-PARTIAL_COVERAGE = 0.03          # 3%
+    warnings = []
+    face_boxes = []
+    max_coverage = 0
+    best_box = None
 
-# 🔁 Movement difference (in pixels) allowed between frames
-MOVEMENT_THRESHOLD = 200         # Lower = stricter movement detection
+    # Stricter thresholds
+    CONF_THRESHOLD = 0.7
+    TOO_CLOSE_COVERAGE = 0.8    # Face too close if coverage exceeds 80%
+    TOO_FAR_COVERAGE = 0.07     # Face too far if coverage below 7%
+    MOVEMENT_THRESHOLD_STRICT = 100  # More strict movement threshold
 
-# 🔲 How far the face can be from edges (ignored now but left as option)
-EDGE_MARGIN_RATIO = 0.04         # Disable this by commenting logic below
-
-# 📐 Acceptable aspect ratio of detected face (height/width)
-ASPECT_RATIO_MIN = 0.6
-ASPECT_RATIO_MAX = 1.8           # Adjust if tilted faces are common
-
-# 🔄 Warnings required before triggering a violation
-VIOLATION_TRIGGER = 2            # Every 2 local violations = 1 actual warning
-
-# ========================================================
-
-prev_box = None
-repeated_violation_count = 0
-
-# ====== LOAD FACE DETECTION MODEL ======
-print("[INIT] Loading face detection model...")
-face_net = cv2.dnn.readNetFromCaffe(config.RES10_PROTO_PATH, config.RES10_MODEL_PATH)
-print("[INIT] Model loaded successfully.")
-
-# ====== FRAME PROCESSING FUNCTION ======
-def process_frame(frame, frame_w, frame_h):
-    global prev_box, repeated_violation_count
-    messages = []
-    local_violations = 0
-
-    blob = cv2.dnn.blobFromImage(cv2.resize(frame, (300, 300)), 1.0,
-                                 (300, 300), (104.0, 177.0, 123.0))
-    try:
-        face_net.setInput(blob)
-        detections = face_net.forward()
-    except Exception as e:
-        print(f"[ERROR] Face detection failed: {e}")
-        return ["⚠️ Face detection error"]
-
-    faces = []
     for i in range(detections.shape[2]):
-        confidence = detections[0, 0, i, 2]
-        if confidence > 0.7:
-            box = detections[0, 0, i, 3:7] * np.array([frame_w, frame_h, frame_w, frame_h])
-            box = np.clip(box.astype("int"), 0, [frame_w, frame_h, frame_w, frame_h])
-            faces.append(box)
+        conf = detections[0,0,i,2]
+        if conf > CONF_THRESHOLD:
+            box = detections[0,0,i,3:7] * np.array([w, h, w, h])
+            box = box.astype("int").tolist()
+            face_boxes.append(box)
+            x1, y1, x2, y2 = box
+            face_area = (x2 - x1) * (y2 - y1)
+            coverage = face_area / (w * h)
+            if coverage > max_coverage:
+                max_coverage = coverage
+                best_box = box
 
-    if len(faces) == 0:
-        messages.append("⚠️ No face detected.")
-        prev_box = None
-    elif len(faces) > 1:
-        messages.append("⚠️ Multiple faces detected.")
-        prev_box = None
+    if len(face_boxes) == 0:
+        warnings.append("⚠️ No face detected")
+        session_stats[session_id]["prev_box"] = None
+
+    elif len(face_boxes) > 1:
+        warnings.append("⚠️ Multiple faces detected")
+        session_stats[session_id]["prev_box"] = None
+
     else:
-        (x1, y1, x2, y2) = faces[0]
-        face_area = (x2 - x1) * (y2 - y1)
-        coverage = face_area / (frame_w * frame_h)
+        x1, y1, x2, y2 = best_box
+        coverage = (x2 - x1) * (y2 - y1) / (w * h)
         aspect_ratio = (y2 - y1) / max((x2 - x1), 1)
 
-        # ✅ Coverage check
-        if coverage < PARTIAL_COVERAGE:
-            messages.append("⚠️ Face not clearly visible.")
-            local_violations += 1
+        if coverage > TOO_CLOSE_COVERAGE:
+            warnings.append("⚠️ Face too close to camera")
+        elif coverage < TOO_FAR_COVERAGE:
+            warnings.append("⚠️ Face too far from camera")
+        elif coverage < PARTIAL_COVERAGE:
+            warnings.append("⚠️ Face not clearly visible")
         elif coverage < MIN_COVERAGE:
-            messages.append("⚠️ Face partially visible.")
-            local_violations += 1
+            warnings.append("⚠️ Face partially visible")
 
-        # ✅ Angle check
         if not (ASPECT_RATIO_MIN <= aspect_ratio <= ASPECT_RATIO_MAX):
-            messages.append("⚠️ Face angle is unusual. Look straight.")
+            warnings.append("⚠️ Face angle is unusual. Look straight.")
 
-        # ✅ Movement detection
-        current_box = [x1, y1, x2, y2]
-        if prev_box is not None:
-            movement = np.sum(np.abs(np.array(current_box) - np.array(prev_box)))
-            if movement > MOVEMENT_THRESHOLD:
-                messages.append("⚠️ Excessive movement detected.")
-                local_violations += 1
-        prev_box = current_box
+        prev = session_stats[session_id]["prev_box"]
+        if prev is not None:
+            movement = sum(abs(np.array([x1, y1, x2, y2]) - np.array(prev)))
+            if movement > MOVEMENT_THRESHOLD_STRICT:
+                warnings.append("⚠️ Excessive movement detected")
+        session_stats[session_id]["prev_box"] = [x1, y1, x2, y2]
 
-    # ✅ Final warning logic
-    repeated_violation_count += local_violations
-    if repeated_violation_count >= VIOLATION_TRIGGER:
-        repeated_violation_count = 0
-        return ["⚠️ Repeated face/movement violation."]
+    return warnings
 
-    return messages if messages else ["✅ All clear"]
-
-# ====== ROUTES ======
 @app.route("/", methods=["GET"])
 def index():
-    return jsonify({"status": "Video proctoring server is running."})
+    return jsonify({"status": "Video proctoring backend running."})
 
+# REST polling endpoint
 @app.route("/analyze", methods=["POST"])
 def analyze():
-    image_file = request.files.get("image")
-    if not image_file:
-        return jsonify({"error": "Missing image file"}), 400
+    data = request.get_json()
+    session_id = data.get("session_id", "default")
+    frame_b64 = data.get("frame")
+    if "," in frame_b64:
+        frame_b64 = frame_b64.split(",")[1]
+    frame_bytes = base64.b64decode(frame_b64)
+    np_arr = np.frombuffer(frame_bytes, np.uint8)
+    frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
-    image_bytes = np.frombuffer(image_file.read(), np.uint8)
-    frame = cv2.imdecode(image_bytes, cv2.IMREAD_COLOR)
-    if frame is None:
-        return jsonify({"error": "Invalid image data"}), 400
+    if session_id not in session_stats:
+        session_stats[session_id] = {"count": 0, "history": [], "prev_box": None}
 
-    h, w = frame.shape[:2]
-    messages = process_frame(frame, w, h)
-    return jsonify({"warning": " | ".join(messages)})
+    warnings = analyze_frame(frame, session_id)
 
-# ====== SOCKET EVENTS ======
-@socketio.on("connect")
-def on_connect():
-    print("[INFO] WebSocket client connected")
-    emit("connected", {"message": "WebSocket connected successfully"})
+    if warnings:
+        session_stats[session_id]["count"] += len(warnings) * WARNINGS_PER_VIOLATION
+        session_stats[session_id]["history"].extend(warnings)
 
+    session_stats[session_id]["history"] = session_stats[session_id]["history"][-LAST_N_WARNINGS:]
+
+    resp = {
+        "status": "warning" if warnings else "ok",
+        "warnings": warnings,
+        "warning_count": session_stats[session_id]["count"],
+        "last_warnings": session_stats[session_id]["history"][:],
+        "timestamp": time.time()
+    }
+    return jsonify(resp)
+
+# WebSocket real-time events
 @socketio.on("frame")
 def on_frame(data):
-    try:
-        encoded = data["image"].split(",")[1] if "," in data["image"] else data["image"]
-        img_bytes = base64.b64decode(encoded)
-        np_img = np.frombuffer(img_bytes, np.uint8)
-        frame = cv2.imdecode(np_img, cv2.IMREAD_COLOR)
+    session_id = data.get("session_id", "default")
+    frame_b64 = data.get("frame") or data.get("image")
+    if "," in frame_b64:
+        frame_b64 = frame_b64.split(",")[1]
+    frame_bytes = base64.b64decode(frame_b64)
+    np_arr = np.frombuffer(frame_bytes, np.uint8)
+    frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
-        if frame is None:
-            emit("warning", {"message": "⚠️ Invalid image format"})
-            return
+    if session_id not in session_stats:
+        session_stats[session_id] = {"count": 0, "history": [], "prev_box": None}
 
-        h, w = frame.shape[:2]
-        messages = process_frame(frame, w, h)
-        emit("warning", {"message": " | ".join(messages)})
+    warnings = analyze_frame(frame, session_id)
 
-    except Exception as e:
-        print(f"[ERROR] Frame processing failed: {e}")
-        emit("warning", {"message": "⚠️ Frame processing error"})
+    if warnings:
+        session_stats[session_id]["count"] += len(warnings) * WARNINGS_PER_VIOLATION
+        session_stats[session_id]["history"].extend(warnings)
+
+    session_stats[session_id]["history"] = session_stats[session_id]["history"][-LAST_N_WARNINGS:]
+
+    emit("warning", {
+        "status": "warning" if warnings else "ok",
+        "warnings": warnings,
+        "warning_count": session_stats[session_id]["count"],
+        "last_warnings": session_stats[session_id]["history"][:],
+        "timestamp": time.time()
+    })
+
+@socketio.on("connect")
+def on_connect():
+    emit("connected", {"message": "WebSocket connected."})
 
 @socketio.on("disconnect")
 def on_disconnect():
     print("[INFO] WebSocket client disconnected")
 
-# ====== RUN SERVER ======
 if __name__ == "__main__":
     socketio.run(app, host="0.0.0.0", port=5000)
-# To run the server, use the command:
-# python app.py 
