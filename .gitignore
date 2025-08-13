@@ -2,7 +2,7 @@
 venv/
 __pycache__/
 *.pyc
-
+test_proctoring.html
 # Byte-compiled / optimized / DLL files
 *.pyd
 *.pyo
